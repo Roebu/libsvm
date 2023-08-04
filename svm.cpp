@@ -1,3 +1,4 @@
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +8,15 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <locale.h>
+#include <random>
+
+#ifdef _TBB
+#include <algorithm>
+#include <atomic>
+#include <execution>
+#include "tbb/iterators.h"
+#endif
+
 #include "svm.h"
 #ifdef _OPENMP
 #include <omp.h>
@@ -1283,14 +1293,22 @@ public:
 	Qfloat *get_Q(int i, int len) const
 	{
 		Qfloat *data;
-		int start, j;
+		int start;
 		if((start = cache->get_data(i,&data,len)) < len)
 		{
+#ifdef _TBB
+			// See https://www.csie.ntu.edu.tw/~cjlin/libsvm/faq.html#f432
+			std::for_each(std::execution::par, tbb::counting_iterator<int>(start), tbb::counting_iterator<int>(len),
+				[this, i, data](int j){
+					data[j] = (Qfloat)(y[i] * y[j] * (this->*kernel_function)(i, j));
+				});
+#else
 #ifdef _OPENMP
 #pragma omp parallel for private(j) schedule(guided)
 #endif
 			for(j=start;j<len;j++)
 				data[j] = (Qfloat)(y[i]*y[j]*(this->*kernel_function)(i,j));
+#endif
 		}
 		return data;
 	}
@@ -1404,11 +1422,19 @@ public:
 		int j, real_i = index[i];
 		if(cache->get_data(real_i,&data,l) < l)
 		{
+#ifdef _TBB
+			// See https://www.csie.ntu.edu.tw/~cjlin/libsvm/faq.html#f432
+			std::for_each(std::execution::par, tbb::counting_iterator<int>(0), tbb::counting_iterator<int>(l),
+				[this, data, real_i](int j){
+					data[j] = (Qfloat)(this->*kernel_function)(real_i, j);
+				});
+#else
 #ifdef _OPENMP
 #pragma omp parallel for private(j) schedule(guided)
 #endif
 			for(j=0;j<l;j++)
 				data[j] = (Qfloat)(this->*kernel_function)(real_i,j);
+#endif
 		}
 
 		// reorder and copy
@@ -1908,12 +1934,14 @@ static void svm_binary_svc_probability(
 	int nr_fold = 5;
 	int *perm = Malloc(int,prob->l);
 	double *dec_values = Malloc(double,prob->l);
+    std::minstd_rand simple_rand;
+
 
 	// random shuffle
 	for(i=0;i<prob->l;i++) perm[i]=i;
 	for(i=0;i<prob->l;i++)
 	{
-		int j = i+rand()%(prob->l-i);
+		int j = i+simple_rand()%(prob->l-i);
 		swap(perm[i],perm[j]);
 	}
 	for(i=0;i<nr_fold;i++)
@@ -2442,6 +2470,8 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param, i
 	int l = prob->l;
 	int *perm = Malloc(int,l);
 	int nr_class;
+    std:: minstd_rand simple_rand;
+    
 	if (nr_fold > l)
 	{
 		fprintf(stderr,"WARNING: # folds (%d) > # data (%d). Will use # folds = # data instead (i.e., leave-one-out cross validation)\n", nr_fold, l);
@@ -2467,7 +2497,7 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param, i
 		for (c=0; c<nr_class; c++)
 			for(i=0;i<count[c];i++)
 			{
-				int j = i+rand()%(count[c]-i);
+				int j = i+simple_rand()%(count[c]-i);
 				swap(index[start[c]+j],index[start[c]+i]);
 			}
 		for(i=0;i<nr_fold;i++)
@@ -2504,7 +2534,7 @@ void svm_cross_validation(const svm_problem *prob, const svm_parameter *param, i
 		for(i=0;i<l;i++) perm[i]=i;
 		for(i=0;i<l;i++)
 		{
-			int j = i+rand()%(l-i);
+			int j = i+simple_rand()%(l-i);
 			swap(perm[i],perm[j]);
 		}
 		for(i=0;i<=nr_fold;i++)
@@ -2605,12 +2635,21 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 	   model->param.svm_type == NU_SVR)
 	{
 		double *sv_coef = model->sv_coef[0];
+#ifdef _TBB
+		// See https://www.csie.ntu.edu.tw/~cjlin/libsvm/faq.html#f432
+		std::atomic<double> sum = 0;
+		std::for_each(std::execution::par, tbb::counting_iterator<int>(0), tbb::counting_iterator<int>(model->l),
+			[&sum, sv_coef, x, model](int i){
+				sum += sv_coef[i] * Kernel::k_function(x, model->SV[i], model->param);
+			});
+#else
 		double sum = 0;
 #ifdef _OPENMP
 #pragma omp parallel for private(i) reduction(+:sum) schedule(guided)
 #endif
 		for(i=0;i<model->l;i++)
 			sum += sv_coef[i] * Kernel::k_function(x,model->SV[i],model->param);
+#endif
 		sum -= model->rho[0];
 		*dec_values = sum;
 
@@ -2625,12 +2664,20 @@ double svm_predict_values(const svm_model *model, const svm_node *x, double* dec
 		int l = model->l;
 
 		double *kvalue = Malloc(double,l);
+#ifdef _TBB
+		// See https://www.csie.ntu.edu.tw/~cjlin/libsvm/faq.html#f432
+		std::for_each(std::execution::par, tbb::counting_iterator<int>(0), tbb::counting_iterator<int>(l),
+			[kvalue, x, model](int i){
+				kvalue[i] = Kernel::k_function(x, model->SV[i], model->param);
+			});
+#else
 #ifdef _OPENMP
 #pragma omp parallel for private(i) schedule(guided)
 #endif
 		for(i=0;i<l;i++)
 			kvalue[i] = Kernel::k_function(x,model->SV[i],model->param);
 
+#endif
 		int *start = Malloc(int,nr_class);
 		start[0] = 0;
 		for(i=1;i<nr_class;i++)
